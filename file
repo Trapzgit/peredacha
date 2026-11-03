@@ -1,0 +1,238 @@
+function Form({onDisableSubmitButton,onSetParams,items,params,profile,service}) {
+    const {useEffect,useMemo,useState}=React;
+    const RECON_SERVICE="datagrid_cleaner_sys";
+
+    const arr=v=>!v?[]:Array.isArray(v)?v:Array.isArray(v.records)?v.records:Array.isArray(v.items)?v.items:[];
+    const payload=x=>x&&x.payload&&typeof x.payload==="object"?x.payload:(x||{});
+    const vals=v=>{
+        const r=[],f=x=>{
+            if(x===null||x===undefined)return;
+            if(Array.isArray(x))return x.forEach(f);
+            if(typeof x==="object"){if("value"in x)return f(x.value);if("values"in x)return f(x.values);if("label"in x)return f(x.label);return Object.values(x).forEach(f);}
+            String(x).split(/[\n\r,;]+/).map(s=>s.trim()).filter(Boolean).forEach(s=>{if(!r.includes(s))r.push(s);});
+        };f(v);return r;
+    };
+    const first=v=>vals(v)[0]||"";
+    const fqdn=(name,dns)=>{
+        name=String(name||"").trim().replace(/^\.+|\.+$/g,"");dns=String(dns||"").trim().replace(/^\.+|\.+$/g,"");
+        if(!name)return"";if(!dns)return name.includes(".")?name:"";
+        if(name.toLowerCase().endsWith("."+dns.toLowerCase()))return name;
+        if(dns.toLowerCase().startsWith(name.toLowerCase()+"."))return dns;
+        return`${name}.${dns}`;
+    };
+    const fmt=n=>{
+        n=Number(n||0);
+        if(n>=1024**3)return`${(n/1024**3).toFixed(2)} GB`;
+        if(n>=1024**2)return`${(n/1024**2).toFixed(2)} MB`;
+        if(n>=1024)return`${(n/1024).toFixed(2)} KB`;
+        return`${n} B`;
+    };
+    const actionText=a=>a==="delete"?"Удалить":a==="truncate"?"Очистить (truncate)":"Не трогать";
+
+    const source=useMemo(()=>{
+        const servers=[],errors=[],seen=new Set();
+        arr(items).forEach(item=>{
+            const r=payload(item),name=first(r.invsvm_svm_name),dns=first(r.invsvm_svm_dns),host=fqdn(name,dns);
+            const segment=first(r.invsvm_nsr_segment).toLowerCase(),environment=first(r.invstend_environment);
+            const ciStend=first(r.invstend_ci_stend),ciIr=first(r.invir_ci_ir),envType=environment.toLowerCase().startsWith("пром")?"PROM":"TEST";
+            if(!host||!segment||!ciStend||!ciIr){errors.push(`Не удалось получить обязательные данные сервера ${name||"unknown"}`);return;}
+            if(seen.has(host))return;seen.add(host);
+            servers.push({fqdn:host,segment,env_type:envType,repo:`${ciStend}_${ciIr}`});
+        });
+        return{servers,errors};
+    },[items]);
+
+    const [loading,setLoading]=useState(false);
+    const [error,setError]=useState("");
+    const [data,setData]=useState([]);
+    const [stats,setStats]=useState(null);
+    const [selectedKeys,setSelectedKeys]=useState(new Set());
+    const [openNodes,setOpenNodes]=useState(new Set());
+
+    useEffect(()=>onDisableSubmitButton(true),[]);
+
+    const index=useMemo(()=>{
+        const cache=new WeakMap(),all=[];
+        const collect=(node,host)=>{
+            if(!node)return[];
+            if(Array.isArray(node)){
+                if(cache.has(node))return cache.get(node);
+                const r=node.flatMap(x=>collect(x,host));cache.set(node,r);return r;
+            }
+            if(typeof node!=="object")return[];
+            if(cache.has(node))return cache.get(node);
+
+            let r=[];
+            if(node.path){
+                if(node.selectable===true&&node.action&&node.action!=="none"){
+                    r=[{key:`${host}\u0000${node.path}`,fqdn:host,path:node.path,name:node.name,action:node.action,kind:node.kind||"file",size:Number(node.size||0),mtime:node.mtime}];
+                } else if(node.children) r=collect(node.children,host);
+            } else {
+                ["categories","current","archive","files","years","months","days","children"].forEach(k=>{
+                    if(node[k])r.push(...collect(node[k],host));
+                });
+            }
+            cache.set(node,r);return r;
+        };
+        data.forEach(host=>all.push(...collect(host,host.fqdn)));
+        return{get:node=>cache.get(node)||[],all};
+    },[data]);
+
+    const selectedOps=useMemo(()=>index.all.filter(x=>selectedKeys.has(x.key)),[index,selectedKeys]);
+
+    useEffect(()=>{
+        onSetParams({
+            servers:source.servers,
+            selected_files:selectedOps.map(x=>({fqdn:x.fqdn,path:x.path,action:x.action,kind:x.kind}))
+        });
+    },[JSON.stringify(source.servers),selectedKeys,index]);
+
+    const toggleOps=ops=>{
+        if(!ops.length)return;
+        const all=ops.every(x=>selectedKeys.has(x.key));
+        setSelectedKeys(prev=>{
+            const next=new Set(prev);
+            ops.forEach(x=>all?next.delete(x.key):next.add(x.key));
+            return next;
+        });
+    };
+
+    const checkbox=(ops)=>{
+        const count=ops.filter(x=>selectedKeys.has(x.key)).length,checked=ops.length>0&&count===ops.length,partial=count>0&&!checked;
+        return <input type="checkbox" disabled={!ops.length} checked={checked}
+            ref={el=>{if(el)el.indeterminate=partial;}}
+            onClick={e=>e.stopPropagation()}
+            onChange={e=>{e.stopPropagation();toggleOps(ops);}}/>;
+    };
+
+    const toggleOpen=id=>setOpenNodes(prev=>{
+        const next=new Set(prev);next.has(id)?next.delete(id):next.add(id);return next;
+    });
+
+    const Branch=({id,ops,label,render,level=0})=>{
+        const open=openNodes.has(id);
+        return <div style={{marginLeft:level?18:0}}>
+            <div style={{display:"flex",alignItems:"center",gap:7,padding:"4px 0"}}>
+                <span onClick={()=>toggleOpen(id)} style={{cursor:"pointer",width:14,userSelect:"none"}}>{open?"▼":"▶"}</span>
+                {checkbox(ops)}
+                <span onClick={()=>toggleOpen(id)} style={{cursor:"pointer",fontWeight:level<=1?600:400}}>{label}</span>
+            </div>
+            {open&&render&&<div>{render()}</div>}
+        </div>;
+    };
+
+    const FileRow=({host,file,level=0})=>{
+        const ops=index.get(file),hasChildren=Array.isArray(file.children)&&file.children.length>0;
+        const label=<span>{file.name} <span style={{color:"#666"}}>— {fmt(file.size)} — {file.mtime||"—"} — {actionText(file.action)}</span></span>;
+        if(hasChildren)return <Branch id={`${host}|file|${file.path}`} ops={ops} label={label} level={level}
+            render={()=>file.children.map((x,i)=><FileRow key={x.path||i} host={host} file={x} level={level+1}/>)}/>;
+        return <div style={{display:"flex",alignItems:"center",gap:7,marginLeft:level*18+21,padding:"4px 0"}}>
+            {checkbox(ops)}{label}
+        </div>;
+    };
+
+    const Current=({host,node,id})=>{
+        if(!node||!node.count)return null;
+        return <Branch id={`${id}|current`} ops={index.get(node)}
+            label={`Актуальные файлы — ${node.count} / ${fmt(node.size)}`} level={1}
+            render={()=>node.files.map((f,i)=><FileRow key={f.path||i} host={host} file={f} level={2}/>)}/>;
+    };
+
+    const Archive=({host,node,id})=>{
+        if(!node||!node.count)return null;
+        return <Branch id={`${id}|archive`} ops={index.get(node)}
+            label={`Архивные файлы — ${node.count} / ${fmt(node.size)}`} level={1}
+            render={()=>node.years.map(y=>
+                <Branch key={y.year} id={`${id}|y|${y.year}`} ops={index.get(y)}
+                    label={`${y.year} — ${y.count} / ${fmt(y.size)}`} level={2}
+                    render={()=>y.months.map(m=>
+                        <Branch key={m.month} id={`${id}|y|${y.year}|m|${m.month}`} ops={index.get(m)}
+                            label={`Месяц ${String(m.month).padStart(2,"0")} — ${m.count} / ${fmt(m.size)}`} level={3}
+                            render={()=>m.days.map(d=>
+                                <Branch key={d.day} id={`${id}|y|${y.year}|m|${m.month}|d|${d.day}`} ops={index.get(d)}
+                                    label={`День ${String(d.day).padStart(2,"0")} — ${d.count} / ${fmt(d.size)}`} level={4}
+                                    render={()=>d.files.map((f,i)=><FileRow key={f.path||i} host={host} file={f} level={5}/>)}/>
+                            )}/>
+                    )}/>
+            )}/>;
+    };
+
+    const Process=({title,value})=><span style={{marginRight:18,color:value&&value.running?"#159447":"#c33"}}>● {title}: {value&&value.running?"активен":"неактивен"}</span>;
+
+    const runRecon=async()=>{
+        if(source.errors.length)return setError(source.errors.join("\n"));
+        if(!source.servers.length)return setError("Выберите хотя бы один сервер.");
+        setLoading(true);setError("");setData([]);setStats(null);setSelectedKeys(new Set());setOpenNodes(new Set());
+        try{
+            const task=await(new Service(RECON_SERVICE)).perform({params:{servers:source.servers}});
+            const p=task.payload||{},errors=[...(p["RLM.ERROR.START"]||[]),...(p.errors||[])];
+            if(p.recon_data&&p.recon_data.length)setData(p.recon_data);
+            if(p.recon_statistics)setStats(p.recon_statistics);
+            if(errors.length)setError(errors.join("\n"));
+            if(task.state==="error"&&!p.recon_data?.length&&!errors.length)setError(task.message||"Разведка завершилась с ошибкой.");
+        }catch(e){setError(e&&e.message?e.message:"Не удалось запустить разведку.");}
+        finally{setLoading(false);}
+    };
+
+    const selectedSize=selectedOps.reduce((s,x)=>s+x.size,0);
+    const styles={
+        box:{border:"1px solid #ddd",borderRadius:6,padding:14,marginBottom:14},
+        table:{width:"100%",borderCollapse:"collapse"},
+        th:{textAlign:"left",padding:9,background:"#f5f5f5",borderBottom:"1px solid #ddd"},
+        td:{padding:9,borderBottom:"1px solid #eee"},
+        error:{padding:12,margin:"12px 0",background:"#f8d7da",color:"#842029",borderRadius:5}
+    };
+
+    return <div style={{maxWidth:1200}}>
+        <div style={styles.box}>
+            <b>Выбрано серверов: {source.servers.length}</b>
+            <table style={{...styles.table,marginTop:12}}>
+                <thead><tr><th style={styles.th}>FQDN</th><th style={styles.th}>Кластер</th><th style={styles.th}>Среда</th><th style={styles.th}>Сегмент</th></tr></thead>
+                <tbody>{source.servers.map(s=><tr key={s.fqdn}><td style={styles.td}>{s.fqdn}</td><td style={styles.td}>{s.repo}</td><td style={styles.td}>{s.env_type}</td><td style={styles.td}>{s.segment}</td></tr>)}</tbody>
+            </table>
+        </div>
+
+        <div style={{textAlign:"right",marginBottom:18}}>
+            <button type="button" onClick={runRecon} disabled={loading||!source.servers.length}>{loading?"Выполняется разведка...":"Разведка"}</button>
+        </div>
+
+        {error&&<div style={styles.error}>{error}</div>}
+
+        {stats&&<div style={styles.box}>
+            Серверов: <b>{stats.servers}</b> · Файлов: <b>{stats.files}</b> · Размер: <b>{fmt(stats.total_size)}</b> · Ошибок: <b>{stats.errors}</b>
+            <br/>
+            Выбрано для очистки: <b>{selectedOps.length}</b> · <b>{fmt(selectedSize)}</b>
+        </div>}
+
+        {data.map((host,i)=>{
+            const hostOps=index.get(host),id=`host|${host.fqdn}`;
+            return <div key={host.fqdn||i} style={styles.box}>
+                <Branch id={id} ops={hostOps}
+                    label={`${host.fqdn} — ${host.status==="ok"?"разведка выполнена":"ошибка"}`}
+                    render={()=>host.status!=="ok"
+                        ? <div style={styles.error}>{host.error||"Не удалось выполнить разведку"}</div>
+                        : <div style={{padding:"8px 0 0 22px"}}>
+                            <div style={{marginBottom:9}}>
+                                <Process title="Ignite" value={host.processes?.ignite}/>
+                                <Process title="ignite-cdc" value={host.processes?.ignite_cdc}/>
+                                <Process title="kafka2ignite" value={host.processes?.kafka2ignite}/>
+                            </div>
+                            <div style={{color:"#666",marginBottom:10}}>
+                                logs: {host.directories?.logs}<br/>
+                                diag: {host.directories?.diag}<br/>
+                                gc: {host.directories?.gc}
+                            </div>
+                            {(host.categories||[]).filter(c=>c.count>0).map(cat=>{
+                                const cid=`${id}|cat|${cat.id}`;
+                                return <Branch key={cat.id} id={cid} ops={index.get(cat)}
+                                    label={`${cat.title} — ${cat.count} файлов / ${fmt(cat.size)}`} level={1}
+                                    render={()=><>
+                                        <Current host={host.fqdn} node={cat.current} id={cid}/>
+                                        <Archive host={host.fqdn} node={cat.archive} id={cid}/>
+                                    </>}/>;
+                            })}
+                        </div>}/>
+            </div>;
+        })}
+    </div>;
+}
